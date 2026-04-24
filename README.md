@@ -25,8 +25,8 @@ Requires an Etherscan API key (free tier is enough for normal usage).
 2. Paste contents of `RockSolid-Etherscan.gs.js` and save.
 3. Review the script before running it.
 4. Reload the spreadsheet.
-5. Use menu **Rocket Pool -> Set Etherscan API key...** (free tier key works).
-6. At first run you will be asked for authorizations, review them
+5. You will be asked for authorizations, review them
+6. Use menu **Rocket Pool -> Set Etherscan API key...** (free tier key works).
 7. (Optional) Use **Rocket Pool -> Set tracked wallet address...**.
 8. Run **Rocket Pool -> Import all (API calls)**.
 
