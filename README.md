@@ -19,7 +19,11 @@ Requires an Etherscan API key (free tier is enough for normal usage).
   - ecosystem-wide views in `wallets_all` and `wallets_summary` with position value and gain/loss
 - Supports hourly auto-update trigger
 
-![alt text](dashboard.png)
+## Dashboard
+
+Preview of the generated Google Sheets dashboard:
+
+![Dashboard](dashboard.png)
 
 ## Setup
 
