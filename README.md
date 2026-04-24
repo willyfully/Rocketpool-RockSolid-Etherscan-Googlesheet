@@ -4,7 +4,7 @@ Google Apps Script for Google Sheets that tracks the Rocket Pool ecosystem and R
 
 It pulls Ethereum logs from Etherscan, stores raw event history in append-only sheets, and rebuilds derived analytics (ratios, APY, wallet P&L, dashboard charts) without extra API calls.
 
-Security warning: this is a Google Apps Script that runs with your Google account permissions. You must do your own code review before using it, then only grant authorizations if you understand and trust what it does. Unfortunately there is no way of limiting the scope of authorizations to just one workbook on Apps Script.
+**Security warning**: this is a Google Apps Script that runs with your Google account permissions. You must do your own code review before using it, then only grant authorizations if you understand and trust what it does. Unfortunately there is no way of limiting the scope of authorizations to just one workbook on Apps Script.
 
 Requires an Etherscan API key (free tier is enough for normal usage).
 
