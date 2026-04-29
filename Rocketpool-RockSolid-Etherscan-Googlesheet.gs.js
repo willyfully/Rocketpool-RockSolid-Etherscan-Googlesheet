@@ -792,8 +792,8 @@ function importAll() {
 //   rock.rETH_ratio: A tx_hash | B block_num | C log_idx | D blockTimestamp
 //                    E event_type | F totalAssets | G totalSupply | H ratio
 //                    I from | J to | K rock_shares | L reth_amt
-//                    M rock.rETH/ETH | N apy_7d_rETH | O apy_30d_rETH
-//                    P apy_7d_ETH | Q apy_30d_ETH
+//                    M rETH/ETH | N rock.rETH/ETH
+//                    O apy_7d_rETH | P apy_30d_rETH | Q apy_7d_ETH | R apy_30d_ETH
 //
 //   wallets_all:  A wallet | B tx_hash | C block_num | D log_idx | E blockTimestamp
 //                 F event_type | G counterparty | H rock.rETH_delta
@@ -876,7 +876,15 @@ function rebuildRethRatio() {
 
 // -----------------------------------------------------------------------------
 // rebuildRockRatio — reads RS_evt_TotalAssetsUpdated + RS_evt_SettleRedeem +
-//                    RS_evt_Transfer (mints/burns), writes rock.rETH_ratio
+//                    RS_evt_Transfer (mints/burns) + rETH_ratio (BalancesUpdated),
+//                    merges all events chronologically, forward-fills both ratio
+//                    columns, then writes rock.rETH_ratio.
+//
+// Column layout:
+//   A–L  unchanged (tx_hash … rETH)
+//   M    rETH/ETH   — actual value on RP rows, carry-forward on rock rows
+//   N    rock.rETH/ETH = H × M for every row
+//   O–R  APY formulas
 // -----------------------------------------------------------------------------
 function rebuildRockRatio() {
   const ss      = SpreadsheetApp.getActiveSpreadsheet();
@@ -912,18 +920,35 @@ function rebuildRockRatio() {
   const mintBurnRows = txRecords
     .filter(tr => tr.from === ZERO_ADDR || tr.to === ZERO_ADDR)
     .map(tr => ({
-      src:     tr.from === ZERO_ADDR ? 'Transfer_Mint' : 'Transfer_Burn',
-      txHash:  tr.txHash,
-      bn:      tr.bn,
-      li:      tr.li,
-      ts:      tr.ts,
-      from:    tr.from,
-      to:      tr.to,
-      value:   tr.value,
+      src:      tr.from === ZERO_ADDR ? 'Transfer_Mint' : 'Transfer_Burn',
+      txHash:   tr.txHash,
+      bn:       tr.bn,
+      li:       tr.li,
+      ts:       tr.ts,
+      from:     tr.from,
+      to:       tr.to,
+      value:    tr.value,
       valueWei: tr.valueWei,
     }));
 
-  const allEvents = [...taRows, ...srRows, ...mintBurnRows]
+  // RP BalancesUpdated events: load from the already-rebuilt rETH_ratio derived sheet.
+  // rebuildRethRatio() always runs before rebuildRockRatio() in rebuildAll(), so this
+  // sheet is up to date. We only take rows with a non-empty ratio (col I, index 8) —
+  // those are the per-block canonical values already deduplicated by rebuildRethRatio.
+  const rethRatioSheet = ss.getSheetByName(SHEET_RETH_RATIO);
+  const rpRows = (rethRatioSheet && rethRatioSheet.getLastRow() > 1)
+    ? rethRatioSheet
+        .getRange(2, 1, rethRatioSheet.getLastRow() - 1, 9)
+        .getValues()
+        .filter(r => r[8] !== '' && r[8] !== null && r[8] !== 0)
+        .map(r => ({
+          src: 'BalancesUpdated', txHash: r[0],
+          bn: Number(r[1]), li: Number(r[2]), ts: r[3],
+          rethRatio: Number(r[8]),
+        }))
+    : [];
+
+  const allEvents = [...taRows, ...srRows, ...mintBurnRows, ...rpRows]
     .sort((a, b) => a.bn - b.bn || a.li - b.li);
 
   if (allEvents.length === 0) {
@@ -937,6 +962,18 @@ function rebuildRockRatio() {
   let lastTotalAssets = 0;
 
   const sheetRows = allEvents.map(ev => {
+    // RP BalancesUpdated row: H (rock ratio) will be filled in the forward-fill pass.
+    // M holds the actual rETH/ETH; N (rock.rETH/ETH) is filled in the same pass.
+    if (ev.src === 'BalancesUpdated') {
+      return [
+        ev.txHash, ev.bn, ev.li, ev.ts, 'BalancesUpdated',
+        '', '', '',       // F totalAssets, G supply, H rock.rETH/rETH (filled later)
+        '', '', '', '',   // I from, J to, K rockShares, L rethAmt
+        ev.rethRatio,     // M actual rETH/ETH
+        '',               // N rock.rETH/ETH (filled later)
+      ];
+    }
+
     let eventType = ev.src;
     let rockShares = '', rethAmt = '', fromAddr = '', toAddr = '';
 
@@ -997,19 +1034,50 @@ function rebuildRockRatio() {
       toAddr,          // J
       rockShares,      // K
       rethAmt,         // L
+      '',              // M rETH/ETH (filled in forward-fill pass)
+      '',              // N rock.rETH/ETH (filled in forward-fill pass)
     ];
   });
 
-  // Same-block dedup: blank col H (ratio) for all but the last event per block.
-  for (let i = 0; i < sheetRows.length - 1; i++) {
-    if (sheetRows[i][1] === sheetRows[i + 1][1]) sheetRows[i][7] = '';
+  // Same-block dedup for rock events: keep H only for the last rock event per block.
+  // RP (BalancesUpdated) rows are excluded — they start with H='' and are handled
+  // separately in the forward-fill pass, so a RP row following a rock row in the
+  // same block must NOT cause the rock row's H to be blanked.
+  const lastRockIdxPerBlock = new Map();
+  for (let i = 0; i < sheetRows.length; i++) {
+    if (sheetRows[i][4] !== 'BalancesUpdated') lastRockIdxPerBlock.set(sheetRows[i][1], i);
+  }
+  for (let i = 0; i < sheetRows.length; i++) {
+    if (sheetRows[i][4] !== 'BalancesUpdated' && lastRockIdxPerBlock.get(sheetRows[i][1]) !== i) {
+      sheetRows[i][7] = '';
+    }
+  }
+
+  // Forward-fill pass: propagate the latest known value of each ratio to rows that
+  // don't have their own, then compute N = H × M for every row.
+  //
+  //   RP event row  → H = carry-forward from last rock event; M = own actual rETH/ETH
+  //   Rock event row → M = carry-forward from last RP event;  H = own computed ratio (or '')
+  //
+  // Update order: read the row's own value first, then carry-forward.
+  let lastH = '', lastM = '';
+  for (const row of sheetRows) {
+    if (row[4] === 'BalancesUpdated') {   // RP event
+      row[7]  = lastH;                    // H = carry-forward rock ratio
+      lastM   = row[12];                  // update state from actual rETH/ETH
+    } else {                              // rock event
+      row[12] = lastM;                    // M = carry-forward rETH/ETH
+      if (row[7] !== '') lastH = row[7];  // update state if H was not blanked by dedup
+    }
+    row[13] = (row[7] !== '' && row[12] !== '') ? row[7] * row[12] : '';
   }
 
   const HEADERS = [
     'tx_hash', 'block_num', 'log_idx', 'blockTimestamp', 'event_type',
     'totalAssets_rETH', 'totalSupply_rETH', 'rock.rETH/rETH',
     'from', 'to', 'rock_rETH', 'rETH',
-    'rock.rETH/ETH', 'apy_7d_rETH', 'apy_30d_rETH', 'apy_7d_ETH', 'apy_30d_ETH',
+    'rETH/ETH', 'rock.rETH/ETH',
+    'apy_7d_rETH', 'apy_30d_rETH', 'apy_7d_ETH', 'apy_30d_ETH',
   ];
   const sheet = prepareDerivedSheet_(ss, SHEET_ROCK_RATIO, HEADERS);
 
@@ -1018,24 +1086,27 @@ function rebuildRockRatio() {
   sheet.getRange(firstDataRow, 4, sheetRows.length, 1).setNumberFormat(FMT_DATE);
   sheet.getRange(firstDataRow, 6, sheetRows.length, 3).setNumberFormat(FMT_18);  // F, G, H
   sheet.getRange(firstDataRow, 11, sheetRows.length, 2).setNumberFormat(FMT_18); // K, L
+  sheet.getRange(firstDataRow, 13, sheetRows.length, 2).setNumberFormat(FMT_18); // M (rETH/ETH), N (rock.rETH/ETH)
 
-  // Formula columns M–Q
+  // Formula columns O–R (APY).
+  // D$2:H spans 5 cols → offset 5 = col H (rock.rETH/rETH).
+  // D$2:N spans 11 cols → offset 11 = col N (rock.rETH/ETH).
   const rockFormulas = sheetRows.map((_, i) => {
     const r = firstDataRow + i;
     return [
-      '=IF(H' + r + '="","",IFERROR(H' + r + '*VLOOKUP(B' + r + ',rETH_ratio!B$2:I,8,TRUE),""))',
       '=IF(H' + r + '="","",IFERROR((H' + r + '/VLOOKUP(D' + r + '-7,D$2:H,5,TRUE))^(365/7)-1,""))',
       '=IF(H' + r + '="","",IFERROR((H' + r + '/VLOOKUP(D' + r + '-30,D$2:H,5,TRUE))^(365/30)-1,""))',
-      '=IF(H' + r + '="","",IFERROR((M' + r + '/VLOOKUP(D' + r + '-7,D$2:M,10,TRUE))^(365/7)-1,""))',
-      '=IF(H' + r + '="","",IFERROR((M' + r + '/VLOOKUP(D' + r + '-30,D$2:M,10,TRUE))^(365/30)-1,""))',
+      '=IF(N' + r + '="","",IFERROR((N' + r + '/VLOOKUP(D' + r + '-7,D$2:N,11,TRUE))^(365/7)-1,""))',
+      '=IF(N' + r + '="","",IFERROR((N' + r + '/VLOOKUP(D' + r + '-30,D$2:N,11,TRUE))^(365/30)-1,""))',
     ];
   });
-  sheet.getRange(firstDataRow, 13, rockFormulas.length, 5).setFormulas(rockFormulas);
-  sheet.getRange(firstDataRow, 13, rockFormulas.length, 1).setNumberFormat(FMT_18);
-  sheet.getRange(firstDataRow, 14, rockFormulas.length, 4).setNumberFormat('0.00%');
+  sheet.getRange(firstDataRow, 15, rockFormulas.length, 4).setFormulas(rockFormulas);
+  sheet.getRange(firstDataRow, 15, rockFormulas.length, 4).setNumberFormat('0.00%');
 
   applyFilter_(sheet);
-  Logger.log('rock.rETH_ratio: rebuilt from ' + sheetRows.length + ' events.');
+  Logger.log('rock.rETH_ratio: rebuilt from ' + sheetRows.length + ' rows (' +
+             rpRows.length + ' BalancesUpdated + ' +
+             (sheetRows.length - rpRows.length) + ' rock events).');
 }
 
 // -----------------------------------------------------------------------------
@@ -1398,27 +1469,30 @@ function buildDashboardLayout_(dash, startDate, endDate) {
 
   dash.getRange('A8').setValue('rock.rETH/ETH').setFontWeight('bold');
   dash.getRange('A9').setValue('Ratio');
-  dash.getRange('B9').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!M:M),\"\")");
+  dash.getRange('B9').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!N:N),\"\")");
   dash.getRange('C9').setValue('ETH per rock.rETH');
   dash.getRange('A10').setValue('7d APY');
-  dash.getRange('B10').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!P:P),\"\")");
+  dash.getRange('B10').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!Q:Q),\"\")");
+  dash.getRange('C10').setFormula('=IF(OR(B10="",B22=""),"", "(" & TEXT(B10-B22,"+0.000%") & " on rETH)")');
   dash.getRange('A11').setValue('30d APY');
-  dash.getRange('B11').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!Q:Q),\"\")");
+  dash.getRange('B11').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!R:R),\"\")");
+  dash.getRange('C11').setFormula('=IF(OR(B11="",B23=""),"", "(" & TEXT(B11-B23,"+0.000%") & " on rETH)")');
   dash.getRange('A12').setValue('Period APY');
-  dash.getRange('B9').setNumberFormat('0.000000');
-  dash.getRange('B10:B12').setNumberFormat('0.00%');
+  dash.getRange('C12').setFormula('=IF(OR(B12="",B24=""),"", "(" & TEXT(B12-B24,"+0.000%") & " on rETH)")');
+  dash.getRange('B9').setNumberFormat('0.000000000');
+  dash.getRange('B10:B12').setNumberFormat('0.000%');
 
   dash.getRange('A14').setValue('rock.rETH/rETH').setFontWeight('bold');
   dash.getRange('A15').setValue('Ratio');
   dash.getRange('B15').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!H:H),\"\")");
   dash.getRange('C15').setValue('rETH per rock.rETH');
   dash.getRange('A16').setValue('7d APY');
-  dash.getRange('B16').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!N:N),\"\")");
+  dash.getRange('B16').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!O:O),\"\")");
   dash.getRange('A17').setValue('30d APY');
-  dash.getRange('B17').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!O:O),\"\")");
+  dash.getRange('B17').setFormula("=IFERROR(LOOKUP(9E+307,'rock.rETH_ratio'!B:B,'rock.rETH_ratio'!P:P),\"\")");
   dash.getRange('A18').setValue('Period APY');
-  dash.getRange('B15').setNumberFormat('0.000000');
-  dash.getRange('B16:B18').setNumberFormat('0.00%');
+  dash.getRange('B15').setNumberFormat('0.000000000');
+  dash.getRange('B16:B18').setNumberFormat('0.000%');
 
   dash.getRange('A20').setValue('rETH/ETH').setFontWeight('bold');
   dash.getRange('A21').setValue('Ratio');
@@ -1429,16 +1503,16 @@ function buildDashboardLayout_(dash, startDate, endDate) {
   dash.getRange('A23').setValue('30d APY');
   dash.getRange('B23').setFormula('=IFERROR(LOOKUP(9E+307,rETH_ratio!B:B,rETH_ratio!L:L),"")');
   dash.getRange('A24').setValue('Period APY');
-  dash.getRange('B21').setNumberFormat('0.000000');
-  dash.getRange('B22:B24').setNumberFormat('0.00%');
+  dash.getRange('B21').setNumberFormat('0.000000000');
+  dash.getRange('B22:B24').setNumberFormat('0.000%');
 
   dash.getRange('A26').setValue('Fees').setFontWeight('bold');
   dash.getRange('A27').setValue('Total in period (ETH)');
   dash.getRange('C27').setValue('(ETH value of fee dilution minted to protocol)').setFontStyle('italic');
-  dash.getRange('B27').setNumberFormat('0.000000');
+  dash.getRange('B27').setNumberFormat('0.00');
   dash.getRange('A28').setValue('Total in period (rock.rETH)');
   dash.getRange('C28').setValue('(rock.rETH shares minted as fees)').setFontStyle('italic');
-  dash.getRange('B28').setNumberFormat(FMT_18);
+  dash.getRange('B28').setNumberFormat('0.00');
   dash.getRange('A29').setValue('Total as % of vault');
   dash.getRange('C29').setValue('(cumulative dilution over the period)').setFontStyle('italic');
   dash.getRange('B29').setNumberFormat('0.000%');
@@ -1447,10 +1521,10 @@ function buildDashboardLayout_(dash, startDate, endDate) {
   dash.getRange('B30').setNumberFormat('0.000%');
   dash.getRange('A31').setValue('Average fee/day (ETH)');
   dash.getRange('C31').setValue('(total ETH fees in period divided by period days)').setFontStyle('italic');
-  dash.getRange('B31').setNumberFormat('0.000000');
+  dash.getRange('B31').setNumberFormat('0.00');
   dash.getRange('A32').setValue('Average fee/day (rock.rETH)');
   dash.getRange('C32').setValue('(total rock.rETH fees in period divided by period days)').setFontStyle('italic');
-  dash.getRange('B32').setNumberFormat(FMT_18);
+  dash.getRange('B32').setNumberFormat('0.00');
 
   dash.setColumnWidth(1, 160);
   dash.setColumnWidth(2, 120);
@@ -1580,7 +1654,7 @@ function readRockSeries_(ss, inRange, tRock, startDate, endDate) {
     return { rockPoints, feeEvents, rockRethApyData, rockEthApyData };
   }
 
-  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 17).getValues();
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 18).getValues();
   for (const r of rows) {
     const h = r[7]; // col H — rock.rETH/rETH
     feedTracker_(tRock, h, r[3], startDate, endDate);
@@ -1592,7 +1666,9 @@ function readRockSeries_(ss, inRange, tRock, startDate, endDate) {
       });
     }
     if (h === '') continue;
-    const [n, o, p, q] = [r[13], r[14], r[15], r[16]];
+    // Cols (0-indexed): M=12 rETH/ETH, N=13 rock.rETH/ETH, O=14 apy_7d_rETH,
+    //                   P=15 apy_30d_rETH, Q=16 apy_7d_ETH, R=17 apy_30d_ETH
+    const [n, o, p, q] = [r[14], r[15], r[16], r[17]];
     rockPoints.push({ date: r[3], rockRethRatio: h, n, o, p, q });
     if (!inRange(r[3])) continue;
     if (n !== '' || o !== '') rockRethApyData.push([r[3], n === '' ? '' : n, o === '' ? '' : o]);
